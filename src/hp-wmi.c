@@ -544,35 +544,22 @@ static DEVICE_ATTR_RO(dock);
 static DEVICE_ATTR_RO(tablet);
 static DEVICE_ATTR_RW(postcode);
 
-static void hp_wmi_notify(u32 value, void *context)
+static void hp_wmi_notify(union acpi_object *data, void *context)
 {
-  struct acpi_buffer response = { ACPI_ALLOCATE_BUFFER, NULL };
   u32 event_id, event_data;
-  union acpi_object *obj;
-  acpi_status status;
   u32 *location;
   int key_code;
 
-  status = wmi_get_event_data(value, &response);
-  if (status == AE_NOT_FOUND)
+  if (!data)
   {
     // We've been woken up without any event data
     // Some models do this when the Omen hotkey is pressed
     event_id = HPWMI_OMEN_KEY;
   }
-  else if (status != AE_OK) {
-    pr_info("bad event value 0x%x status 0x%x\n", value, status);
-    return;
-  }
   else
   {
-    obj = (union acpi_object *)response.pointer;
-
-    if (!obj)
-      return;
-    if (obj->type != ACPI_TYPE_BUFFER) {
-      pr_info("Unknown response received %d\n", obj->type);
-      kfree(obj);
+    if (data->type != ACPI_TYPE_BUFFER) {
+      pr_info("Unknown response received %d\n", data->type);
       return;
     }
 
@@ -580,19 +567,17 @@ static void hp_wmi_notify(u32 value, void *context)
     * Depending on ACPI version the concatenation of id and event data
     * inside _WED function will result in a 8 or 16 byte buffer.
     */
-    location = (u32 *)obj->buffer.pointer;
-    if (obj->buffer.length == 8) {
+    location = (u32 *)data->buffer.pointer;
+    if (data->buffer.length == 8) {
       event_id = *location;
       event_data = *(location + 1);
-    } else if (obj->buffer.length == 16) {
+    } else if (data->buffer.length == 16) {
       event_id = *location;
       event_data = *(location + 2);
     } else {
-      pr_info("Unknown buffer length %d\n", obj->buffer.length);
-      kfree(obj);
+      pr_info("Unknown buffer length %d\n", data->buffer.length);
       return;
     }
-    kfree(obj);
   }
 
   switch (event_id) {
@@ -1173,7 +1158,7 @@ add_sysfs_error:
   return err;
 }
 
-static int __exit hp_wmi_bios_remove(struct platform_device *device)
+static void __exit hp_wmi_bios_remove(struct platform_device *device)
 {
   int i;
   cleanup_sysfs(device);
@@ -1195,8 +1180,6 @@ static int __exit hp_wmi_bios_remove(struct platform_device *device)
     rfkill_unregister(wwan_rfkill);
     rfkill_destroy(wwan_rfkill);
   }
-
-  return 0;
 }
 
 static int hp_wmi_resume_handler(struct device *device)
