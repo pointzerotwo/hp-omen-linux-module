@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""
+omen-rgb - CLI tool for managing HP Omen RGB zones
+Manages RGB lighting for HP Omen laptops with FourZone keyboard support
+"""
+
+import argparse
+import os
+import re
+import sys
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+# Constants
+SYSFS_BASE = "/sys/devices/platform/hp-wmi/rgb_zones"
+ZONE_COUNT = 4
+CONFIG_DIR = Path.home() / ".config" / "omen-rgb"
+CONFIG_FILE = CONFIG_DIR / "schemes.json"
+
+# Named color presets (hex format)
+COLOR_PRESETS = {
+    "red": "FF0000",
+    "green": "00FF00",
+    "blue": "0000FF",
+    "cyan": "00FFFF",
+    "magenta": "FF00FF",
+    "yellow": "FFFF00",
+    "white": "FFFFFF",
+    "orange": "FF8000",
+    "purple": "8000FF",
+    "pink": "FF00AA",
+    "lime": "80FF00",
+    "teal": "00FF80",
+    "off": "000000",
+    "black": "000000",
+}
+
+
+def validate_hex_color(color: str) -> str:
+    """Validate and normalize hex color format."""
+    # Check if it's a named color preset
+    color_lower = color.lower()
+    if color_lower in COLOR_PRESETS:
+        return COLOR_PRESETS[color_lower]
+
+    # Remove # if present
+    color = color.lstrip('#')
+
+    # Validate hex format
+    if not re.match(r'^[0-9A-Fa-f]{6}$', color):
+        raise ValueError(f"Invalid color format: {color}. Use 6-digit hex (e.g., FF0000) or a named color.")
+
+    return color.upper()
+
+
+def validate_zone(zone: int) -> None:
+    """Validate zone number is within valid range."""
+    if zone < 0 or zone >= ZONE_COUNT:
+        raise ValueError(f"Invalid zone: {zone}. Must be between 0 and {ZONE_COUNT - 1}.")
+
+
+def check_sysfs_exists() -> None:
+    """Check if the sysfs interface exists."""
+    if not os.path.exists(SYSFS_BASE):
+        print(f"Error: {SYSFS_BASE} not found.", file=sys.stderr)
+        print("Make sure the hp-wmi kernel module is loaded.", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_zone_path(zone: int) -> Path:
+    """Get the sysfs path for a specific zone."""
+    return Path(SYSFS_BASE) / f"zone{zone:02d}"
+
+
+def set_zone_color(zone: int, color: str) -> None:
+    """Set the color for a specific zone."""
+    validate_zone(zone)
+    color = validate_hex_color(color)
+    zone_path = get_zone_path(zone)
+
+    try:
+        with open(zone_path, 'w') as f:
+            f.write(color)
+        print(f"Zone {zone}: {color}")
+    except PermissionError:
+        print(f"Error: Permission denied. Try running with sudo.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error setting zone {zone}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_zone_color(zone: int) -> Tuple[int, int, int]:
+    """Read the current color from a zone. Returns (R, G, B) tuple."""
+    validate_zone(zone)
+    zone_path = get_zone_path(zone)
+
+    try:
+        with open(zone_path, 'r') as f:
+            content = f.read().strip()
+
+        # Parse format: "red: 255, green: 0, blue: 255"
+        match = re.match(r'red:\s*(\d+),\s*green:\s*(\d+),\s*blue:\s*(\d+)', content)
+        if match:
+            r, g, b = map(int, match.groups())
+            return (r, g, b)
+        else:
+            raise ValueError(f"Unexpected format: {content}")
+    except FileNotFoundError:
+        print(f"Error: Zone {zone} not found at {zone_path}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error reading zone {zone}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def rgb_to_hex(r: int, g: int, b: int) -> str:
+    """Convert RGB values to hex string."""
+    return f"{r:02X}{g:02X}{b:02X}"
+
+
+def parse_zone_color_pairs(pairs: List[str]) -> List[Tuple[int, str]]:
+    """Parse zone:color pairs from positional arguments."""
+    result = []
+    for pair in pairs:
+        if ':' not in pair:
+            raise ValueError(f"Invalid format: {pair}. Expected format: ZONE:COLOR (e.g., 0:FF0000)")
+
+        zone_str, color = pair.split(':', 1)
+        try:
+            zone = int(zone_str)
+        except ValueError:
+            raise ValueError(f"Invalid zone number: {zone_str}")
+
+        result.append((zone, color))
+
+    return result
+
+
+def save_config(name: str) -> None:
+    """Save current zone colors to a named configuration."""
+    check_sysfs_exists()
+
+    # Read all current colors
+    colors = {}
+    for zone in range(ZONE_COUNT):
+        r, g, b = get_zone_color(zone)
+        colors[str(zone)] = rgb_to_hex(r, g, b)
+
+    # Create config directory if it doesn't exist
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Load existing configs or create new
+    configs = {}
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, 'r') as f:
+            configs = json.load(f)
+
+    configs[name] = colors
+
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(configs, f, indent=2)
+
+    print(f"Saved configuration '{name}':")
+    for zone, color in colors.items():
+        print(f"  Zone {zone}: {color}")
+
+
+def load_config(name: str) -> None:
+    """Load and apply a named configuration."""
+    check_sysfs_exists()
+
+    if not CONFIG_FILE.exists():
+        print(f"Error: No configurations found at {CONFIG_FILE}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(CONFIG_FILE, 'r') as f:
+        configs = json.load(f)
+
+    if name not in configs:
+        print(f"Error: Configuration '{name}' not found.", file=sys.stderr)
+        print(f"Available configurations: {', '.join(configs.keys())}", file=sys.stderr)
+        sys.exit(1)
+
+    colors = configs[name]
+    print(f"Loading configuration '{name}':")
+    for zone_str, color in colors.items():
+        zone = int(zone_str)
+        set_zone_color(zone, color)
+
+
+def list_configs() -> None:
+    """List all saved configurations."""
+    if not CONFIG_FILE.exists():
+        print("No saved configurations found.")
+        return
+
+    with open(CONFIG_FILE, 'r') as f:
+        configs = json.load(f)
+
+    if not configs:
+        print("No saved configurations found.")
+        return
+
+    print("Saved configurations:")
+    for name, colors in configs.items():
+        print(f"\n  {name}:")
+        for zone, color in colors.items():
+            print(f"    Zone {zone}: {color}")
+
+
+def list_color_presets() -> None:
+    """List all available named color presets."""
+    print("Available color presets:")
+    for name, hex_val in sorted(COLOR_PRESETS.items()):
+        print(f"  {name:12} - #{hex_val}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="CLI tool for managing HP Omen RGB zones",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Set zone 0 to red
+  sudo omen-rgb --zone 0 --color FF0000
+  sudo omen-rgb --zone 0 --color red
+
+  # Set multiple zones to the same color
+  sudo omen-rgb --zones 0,1,2 --color cyan
+
+  # Set all zones to blue
+  sudo omen-rgb --all --color blue
+
+  # Set different colors for different zones
+  sudo omen-rgb 0:FF0000 1:00FF00 2:0000FF 3:FFFF00
+
+  # Get current color of zone 0
+  omen-rgb --get 0
+
+  # Get all zone colors
+  omen-rgb --get-all
+
+  # Save current configuration
+  sudo omen-rgb --save-config my-scheme
+
+  # Load saved configuration
+  sudo omen-rgb --load-config my-scheme
+
+  # List saved configurations
+  omen-rgb --list-configs
+
+  # List available color presets
+  omen-rgb --list-colors
+        """
+    )
+
+    # Mutually exclusive group for main operations
+    group = parser.add_mutually_exclusive_group()
+
+    # Setting colors
+    group.add_argument('--zone', type=int, metavar='N',
+                      help='Set color for a single zone (0-3)')
+    group.add_argument('--zones', type=str, metavar='N,N,...',
+                      help='Set color for multiple zones (e.g., 0,1,2)')
+    group.add_argument('--all', action='store_true',
+                      help='Set color for all zones')
+
+    # Color argument (used with --zone, --zones, or --all)
+    parser.add_argument('--color', type=str, metavar='COLOR',
+                       help='Color in hex format (e.g., FF0000) or named color (e.g., red)')
+
+    # Reading colors
+    group.add_argument('--get', type=int, metavar='N',
+                      help='Get current color of a zone (0-3)')
+    group.add_argument('--get-all', action='store_true',
+                      help='Get current colors of all zones')
+
+    # Config management
+    group.add_argument('--save-config', type=str, metavar='NAME',
+                      help='Save current zone colors to a named configuration')
+    group.add_argument('--load-config', type=str, metavar='NAME',
+                      help='Load and apply a named configuration')
+    group.add_argument('--list-configs', action='store_true',
+                      help='List all saved configurations')
+
+    # Info
+    group.add_argument('--list-colors', action='store_true',
+                      help='List all available named color presets')
+
+    # Positional arguments for zone:color pairs
+    parser.add_argument('pairs', nargs='*', metavar='ZONE:COLOR',
+                       help='Set different colors for zones (e.g., 0:FF0000 1:00FF00)')
+
+    args = parser.parse_args()
+
+    # Handle positional zone:color pairs
+    if args.pairs:
+        check_sysfs_exists()
+        try:
+            pairs = parse_zone_color_pairs(args.pairs)
+            for zone, color in pairs:
+                set_zone_color(zone, color)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Handle --zone
+    if args.zone is not None:
+        if not args.color:
+            print("Error: --color is required when using --zone", file=sys.stderr)
+            sys.exit(1)
+        check_sysfs_exists()
+        try:
+            set_zone_color(args.zone, args.color)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Handle --zones
+    if args.zones:
+        if not args.color:
+            print("Error: --color is required when using --zones", file=sys.stderr)
+            sys.exit(1)
+        check_sysfs_exists()
+        try:
+            zones = [int(z.strip()) for z in args.zones.split(',')]
+            for zone in zones:
+                set_zone_color(zone, args.color)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Handle --all
+    if args.all:
+        if not args.color:
+            print("Error: --color is required when using --all", file=sys.stderr)
+            sys.exit(1)
+        check_sysfs_exists()
+        try:
+            for zone in range(ZONE_COUNT):
+                set_zone_color(zone, args.color)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Handle --get
+    if args.get is not None:
+        check_sysfs_exists()
+        try:
+            r, g, b = get_zone_color(args.get)
+            hex_color = rgb_to_hex(r, g, b)
+            print(f"Zone {args.get}: #{hex_color} (R:{r}, G:{g}, B:{b})")
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Handle --get-all
+    if args.get_all:
+        check_sysfs_exists()
+        print("Current zone colors:")
+        for zone in range(ZONE_COUNT):
+            r, g, b = get_zone_color(zone)
+            hex_color = rgb_to_hex(r, g, b)
+            print(f"  Zone {zone}: #{hex_color} (R:{r}, G:{g}, B:{b})")
+        return
+
+    # Handle --save-config
+    if args.save_config:
+        try:
+            save_config(args.save_config)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Handle --load-config
+    if args.load_config:
+        try:
+            load_config(args.load_config)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Handle --list-configs
+    if args.list_configs:
+        try:
+            list_configs()
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Handle --list-colors
+    if args.list_colors:
+        list_color_presets()
+        return
+
+    # No arguments provided
+    parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
